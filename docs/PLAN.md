@@ -158,4 +158,5 @@ reaches the payer), and Q12 (wallets on a real domain).
 - A replayed renewal key returned the earlier charge, with no new charge at
   PayArc (22 charges before and after).
 
-Next: Phase 3, the `payarcjs` CiviCRM extension.
+Next: Phase 3, the `payarcjs` CiviCRM extension. Start from
+[HANDOFF-civicrm.md](HANDOFF-civicrm.md).
