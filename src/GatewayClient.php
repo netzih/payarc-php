@@ -196,37 +196,69 @@ class GatewayClient {
   }
 
   /**
-   * Refund a settled charge in full (NULL amount) or in part. PayArc answers
-   * an unsettled one with HTTP 422 "Return Not Allowed.".
+   * Give money back on a charge, in full (NULL amount) or in part.
+   *
+   * PayArc does not refuse a refund of an unsettled charge as documented: it
+   * voids the WHOLE charge, whatever amount was asked for, and answers 201
+   * with status "void" (verified in the sandbox, 2026-09-24: a $0.75 refund
+   * of an unbatched $2.00 charge reversed all $2.00). So this reads the
+   * charge first:
+   * - Full amount: sent as is. PayArc voids an unsettled charge and refunds a
+   *   settled one; the response status says which (see reverse()).
+   * - Partial amount: sent only when the charge is known to have settled
+   *   (Charge::isSettled()); otherwise UnsettledPartialRefundException and
+   *   nothing is sent.
    *
    * @param array $options
    *   'reason' (a VOID_REASONS value), 'description', 'reference' (sent as
    *   the Idempotency-Key).
+   *
+   * @throws UnsettledPartialRefundException
    */
   public function refund(string $chargeId, ?string $amount = NULL, array $options = []): array {
+    $chargeId = $this->validId($chargeId, 'charge');
+    $charge = $this->getCharge($chargeId);
+    $remaining = Charge::remainingCents($charge);
+    if ($remaining === NULL) {
+      throw new GatewayException('PayArc did not report the amount of charge ' . $chargeId . '.', 0, $charge);
+    }
+    if ($remaining === 0) {
+      throw new GatewayException('This charge has already been voided or refunded in full.', 0, $charge);
+    }
+    $cents = $amount === NULL ? $remaining : $this->positiveCents($amount);
+    if ($cents > $remaining) {
+      throw new \InvalidArgumentException(sprintf('The refund (%s) is more than the %s left on the charge.', Amount::fromCents($cents), Amount::fromCents($remaining)));
+    }
+    if ($cents < $remaining && !Charge::isSettled($charge)) {
+      throw new UnsettledPartialRefundException(
+        'This charge may not have settled yet. PayArc would void the whole charge instead of refunding part of it, so nothing was sent. Refund the partial amount after the charge settles (normally the next business day), or refund it in full.',
+        0,
+        $charge
+      );
+    }
+
     $payload = [
       'reason' => in_array($options['reason'] ?? '', self::VOID_REASONS, TRUE) ? $options['reason'] : 'requested_by_customer',
       'do_not_send_email_to_customer' => 'yes',
       'do_not_send_sms_to_customer' => 'yes',
     ];
-    if ($amount !== NULL) {
-      $payload['amount'] = $this->positiveCents($amount);
+    // The amount is left out for a full refund of an untouched charge, the
+    // one case verified to void or refund the whole charge cleanly.
+    if ($cents < $remaining || (int) ($charge['amount_refunded'] ?? 0) > 0) {
+      $payload['amount'] = $cents;
     }
     if (isset($options['description']) && trim((string) $options['description']) !== '') {
       $payload['description'] = $this->truncate((string) $options['description'], 255);
     }
-    return $this->request('POST', '/charges/' . rawurlencode($this->validId($chargeId, 'charge')) . '/refunds', $payload, $this->idempotencyKey($options));
+    return $this->request('POST', '/charges/' . rawurlencode($chargeId) . '/refunds', $payload, $this->idempotencyKey($options));
   }
 
   /**
-   * Give money back whichever state the charge is in: refund it if it has
-   * settled, void it if it has not.
+   * refund(), reporting what PayArc actually did.
    *
-   * PayArc has no documented "settled" flag, so a refund is tried first and
-   * a "Return Not Allowed." refusal means the charge is still unsettled. A
-   * full amount is then voided; a partial amount cannot be (a void reverses
-   * everything), so UnsettledPartialRefundException is thrown and nothing
-   * moves.
+   * A refund of an unsettled charge comes back as a void (status "void").
+   * The documented behaviour, a "Return Not Allowed." refusal, has not been
+   * seen but is still handled: the full amount is then voided.
    *
    * @return array{action: 'refund'|'void', response: array}
    *
@@ -234,9 +266,11 @@ class GatewayClient {
    */
   public function reverse(string $chargeId, ?string $amount = NULL, array $options = []): array {
     try {
-      return ['action' => 'refund', 'response' => $this->refund($chargeId, $amount, $options)];
+      $response = $this->refund($chargeId, $amount, $options);
+      $voided = in_array(strtolower((string) ($response['status'] ?? '')), ['void', 'voided'], TRUE);
+      return ['action' => $voided ? 'void' : 'refund', 'response' => $response];
     }
-    catch (AmbiguousGatewayException $e) {
+    catch (AmbiguousGatewayException | UnsettledPartialRefundException $e) {
       throw $e;
     }
     catch (GatewayException $e) {
@@ -244,18 +278,8 @@ class GatewayClient {
         throw $e;
       }
     }
-
-    if ($amount !== NULL) {
-      $charge = $this->getCharge($chargeId);
-      $remaining = Charge::remainingCents($charge);
-      if ($remaining === NULL || Amount::toCents($amount) !== $remaining) {
-        throw new UnsettledPartialRefundException(
-          'This charge has not settled yet, so only the full amount can be returned (by voiding it). Refund the partial amount after the charge settles, normally the next day.',
-          422,
-          $charge
-        );
-      }
-    }
+    // Only a full refund reaches PayArc for a charge not known to be
+    // settled, so voiding here never reverses more than was asked.
     $reason = in_array($options['reason'] ?? '', self::VOID_REASONS, TRUE) ? $options['reason'] : 'requested_by_customer';
     return ['action' => 'void', 'response' => $this->void($chargeId, $reason, $options['description'] ?? NULL)];
   }
@@ -375,8 +399,7 @@ class GatewayClient {
    * @param array $options
    *   'reference': idempotency key, also stored as metadata REFERENCE_KEY.
    *   'invoice': our invoice number (metadata 'invoice').
-   *   'description': shown with the charge (sent as 'description';
-   *     PayArc returns it as charge_description).
+   *   'description': shown with the charge (charge_description).
    *   'statement_description': text on the card statement.
    *   'email', 'phone': the payer's; shown in the dashboard. PayArc's own
    *     receipt stays off (do_not_send_* is always sent).
@@ -394,7 +417,9 @@ class GatewayClient {
       'do_not_send_sms_to_customer' => 'yes',
     ];
     if (!empty($options['description'])) {
-      $payload['description'] = $this->truncate((string) $options['description'], 255);
+      // 'description' is silently dropped; 'charge_description' is stored
+      // and shown (verified in the sandbox, 2026-09-24).
+      $payload['charge_description'] = $this->truncate((string) $options['description'], 255);
     }
     if (!empty($options['statement_description'])) {
       $payload['statement_description'] = $this->truncate((string) $options['statement_description'], 25);

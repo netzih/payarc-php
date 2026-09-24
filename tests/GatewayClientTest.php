@@ -48,6 +48,8 @@ final class GatewayClientTest extends TestCase {
     self::assertSame('yes', $body['do_not_send_email_to_customer']);
     self::assertSame('yes', $body['do_not_send_sms_to_customer']);
     self::assertSame('donor@example.org', $body['email']);
+    self::assertSame('Donation', $body['charge_description']);
+    self::assertArrayNotHasKey('description', $body);
     self::assertSame([
       'contact_id' => '7',
       'invoice' => 'GF3-9',
@@ -212,71 +214,108 @@ final class GatewayClientTest extends TestCase {
     self::assertSame('Reversal Not Allowed.', $auth['void_error']);
   }
 
-  public function testRefundSendsCentsReasonAndSuppressesReceipts(): void {
-    $this->queue(200, ['data' => $this->charge(['status' => 'partial_refund'])]);
+  public function testPartialRefundOfASettledChargeSendsCents(): void {
+    $this->queue(200, ['data' => $this->charge(['status' => 'settled'])]);
+    $this->queue(201, ['data' => $this->charge(['status' => 'partial_refund', 'amount_refunded' => 250])]);
 
-    $this->client()->refund('CH1', '2.50', ['reference' => 'ref-r1', 'description' => 'Donor asked']);
+    $result = $this->client()->reverse('CH1', '2.50', ['reference' => 'ref-r1', 'description' => 'Donor asked']);
 
-    self::assertSame('https://testapi.payarc.net/v1/charges/CH1/refunds', $this->requests[0]['url']);
-    self::assertSame('ref-r1', $this->header($this->requests[0], 'Idempotency-Key'));
+    self::assertSame('refund', $result['action']);
+    self::assertSame('GET', $this->requests[0]['method']);
+    self::assertSame('https://testapi.payarc.net/v1/charges/CH1/refunds', $this->requests[1]['url']);
+    self::assertSame('ref-r1', $this->header($this->requests[1], 'Idempotency-Key'));
     self::assertSame([
       'reason' => 'requested_by_customer',
       'do_not_send_email_to_customer' => 'yes',
       'do_not_send_sms_to_customer' => 'yes',
       'amount' => 250,
       'description' => 'Donor asked',
-    ], json_decode($this->requests[0]['body'], TRUE));
+    ], json_decode($this->requests[1]['body'], TRUE));
   }
 
-  public function testReverseRefundsASettledCharge(): void {
-    $this->queue(200, ['data' => $this->charge(['status' => 'refunded'])]);
+  public function testPartialRefundOfAChargeNotKnownToBeSettledIsNeverSent(): void {
+    // PayArc would void the whole charge (verified in the sandbox).
+    $this->queue(200, ['data' => $this->charge(['status' => 'submitted_for_settlement'])]);
 
-    $result = $this->client()->reverse('CH1');
-
-    self::assertSame('refund', $result['action']);
-    self::assertCount(1, $this->requests);
+    try {
+      $this->client()->refund('CH1', '4.00');
+      self::fail('No exception.');
+    }
+    catch (UnsettledPartialRefundException $e) {
+      self::assertCount(1, $this->requests);
+      self::assertSame('GET', $this->requests[0]['method']);
+    }
   }
 
-  public function testReverseVoidsAnUnsettledChargeInFull(): void {
+  public function testFullRefundOmitsTheAmountAndReportsAVoid(): void {
+    $this->queue(200, ['data' => $this->charge(['status' => 'submitted_for_settlement'])]);
+    $this->queue(201, ['data' => $this->charge(['status' => 'void', 'amount_voided' => 1000])]);
+
+    $result = $this->client()->reverse('CH1', '10.00');
+
+    self::assertSame('void', $result['action']);
+    self::assertArrayNotHasKey('amount', json_decode($this->requests[1]['body'], TRUE));
+  }
+
+  public function testFullRefundOfASettledChargeIsARefund(): void {
+    $this->queue(200, ['data' => $this->charge()]);
+    $this->queue(201, ['data' => $this->charge(['status' => 'refunded', 'amount_refunded' => 1000])]);
+
+    self::assertSame('refund', $this->client()->reverse('CH1')['action']);
+  }
+
+  public function testRemainderAfterAPartialRefundIsSentWithItsAmount(): void {
+    $this->queue(200, ['data' => $this->charge(['status' => 'partial_refund', 'amount_refunded' => 400])]);
+    $this->queue(201, ['data' => $this->charge(['status' => 'refunded', 'amount_refunded' => 1000])]);
+
+    $this->client()->refund('CH1');
+
+    self::assertSame(600, json_decode($this->requests[1]['body'], TRUE)['amount']);
+  }
+
+  public function testRefundOfAReversedChargeIsRefusedWithoutSending(): void {
+    // PayArc answers 201 to a refund of a voided charge, so it must not be asked.
+    $this->queue(200, ['data' => $this->charge(['status' => 'void', 'amount_voided' => 75])]);
+
+    $this->expectException(GatewayException::class);
+    $this->expectExceptionMessage('already been voided or refunded');
+    try {
+      $this->client()->refund('CH1', '1.00');
+    }
+    finally {
+      self::assertCount(1, $this->requests);
+    }
+  }
+
+  public function testRefundMoreThanRemainsIsRefused(): void {
+    $this->queue(200, ['data' => $this->charge(['status' => 'settled'])]);
+
+    $this->expectException(\InvalidArgumentException::class);
+    $this->client()->refund('CH1', '10.01');
+  }
+
+  public function testReverseVoidsAfterTheDocumentedRefusal(): void {
+    $this->queue(200, ['data' => $this->charge()]);
     $this->queue(422, ['status' => 'error', 'code' => 0, 'message' => 'Return Not Allowed.', 'status_code' => 422]);
     $this->queue(201, ['data' => $this->charge(['status' => 'void'])]);
 
     $result = $this->client()->reverse('CH1');
 
     self::assertSame('void', $result['action']);
-    self::assertSame('https://testapi.payarc.net/v1/charges/CH1/void', $this->requests[1]['url']);
-  }
-
-  public function testReverseVoidsWhenThePartialAmountIsTheWholeRemainder(): void {
-    $this->queue(422, ['message' => 'Return Not Allowed.']);
-    $this->queue(200, ['data' => $this->charge(['amount' => 1000])]);
-    $this->queue(201, ['data' => $this->charge(['status' => 'void'])]);
-
-    self::assertSame('void', $this->client()->reverse('CH1', '10.00')['action']);
-  }
-
-  public function testReverseRefusesAPartialAmountOfAnUnsettledCharge(): void {
-    $this->queue(422, ['message' => 'Return Not Allowed.']);
-    $this->queue(200, ['data' => $this->charge(['amount' => 1000])]);
-
-    try {
-      $this->client()->reverse('CH1', '4.00');
-      self::fail('No exception.');
-    }
-    catch (UnsettledPartialRefundException $e) {
-      self::assertCount(2, $this->requests);
-    }
+    self::assertSame('https://testapi.payarc.net/v1/charges/CH1/void', $this->requests[2]['url']);
   }
 
   public function testReversePassesOnOtherRefundErrors(): void {
+    $this->queue(200, ['data' => $this->charge()]);
     $this->queue(422, ['message' => 'The given data was invalid.', 'errors' => ['amount' => ['Too much.']]]);
 
     $this->expectException(GatewayException::class);
     $this->expectExceptionMessage('Too much.');
-    $this->client()->reverse('CH1', '99.00');
+    $this->client()->reverse('CH1');
   }
 
   public function testReverseDoesNotVoidAfterAnAmbiguousRefund(): void {
+    $this->queue(200, ['data' => $this->charge()]);
     $this->queue(502, '');
 
     try {
@@ -284,7 +323,7 @@ final class GatewayClientTest extends TestCase {
       self::fail('No exception.');
     }
     catch (AmbiguousGatewayException $e) {
-      self::assertCount(1, $this->requests);
+      self::assertCount(2, $this->requests);
     }
   }
 

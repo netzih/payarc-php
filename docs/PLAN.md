@@ -70,3 +70,50 @@ integrations (`usaepayjs` for CiviCRM and `usaepay-wordpress`).
 Record each answer here with the date and the report file it came from.
 Then update the code comments that say "assumed", "not documented" or
 "INFERRED".
+
+## Answers so far
+
+### 2026-09-24: server tokens
+
+Source: `probe-20260924043923.json`, plus follow-up tests on the same day.
+
+- **Q2: yes.** A saved card charges without a CVV, with `eci_indicator` 2.
+  This held for plain server tokens and for `authorize_card` ones. Server
+  tokens come back `is_verified=1` either way. Hosted Fields tokens are
+  still to test (Q1).
+- **Q3: strict replay.** The same `Idempotency-Key` returns the original
+  charge, even when the body differs (a different amount still returned
+  the $1.01 charge). So `Reconcile` can resend safely. It must send the
+  identical request, because a changed amount is ignored, not refused. How
+  long keys are kept is still unknown.
+- **Q4: yes, single-use.** Reusing a token under a new key gets HTTP 404
+  "The requested token_id is not valid or already used".
+- **Q5.** With `include=transaction_metadata`, metadata comes back as
+  `transaction_metadata.data[] = {object: TransactionMeta, key, value}`,
+  both on GET and in the list. The list's `created_at` is a Unix time, not
+  the documented string. `findChargeByReference()` works.
+- **Q6: the docs are wrong, and it is dangerous.** A refund of an
+  **unsettled** charge is not refused. PayArc **voids the whole charge**,
+  whatever amount was asked for, and answers HTTP 201 with status `void`.
+  In one test, a $0.75 refund of a $2.00 charge left status `void`,
+  `net_amount` 0 and `amount_voided` 75. A second $0.25 "refund" was
+  accepted too (201, `amount_voided` overwritten to 25). A real void
+  afterwards was refused with 409 "Reversal Not Allowed.", which is also
+  the answer to voiding twice. So `amount_voided` cannot be trusted.
+  - **Library change:** `refund()` reads the charge first. It sends a
+    partial amount only when `Charge::isSettled()`; otherwise it throws
+    `UnsettledPartialRefundException` and sends nothing. It never sends
+    anything for a charge that is already void or refunded.
+  - **Still open:** what status a *batched* charge shows. Watch charges
+    were left captured on 2026-09-24 (`tests/sandbox/reports/settle-watch.txt`)
+    to find out.
+- **Q7.** `description` is silently dropped. `charge_description` is stored
+  and shown, so the library now sends that.
+- **Q8: both ways.** A decline can come as a 201 charge with status
+  `Declined` and `failure_code` D2026 ("Do not honor"), or as an HTTP error
+  with the same code. The sandbox declines some charges seemingly at random
+  (Visa $1.12, Mastercard $1.20 through the library), while the same cards
+  and amounts pass minutes later.
+- **Other.** The rate limit header shows 90 requests. The account's default
+  statement descriptor is "Chabad Jewish Center of R", which is too long, so
+  PayArc cuts it off.

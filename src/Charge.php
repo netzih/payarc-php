@@ -105,7 +105,28 @@ final class Charge {
   }
 
   /**
-   * Cents still refundable: amount minus refunded and voided amounts.
+   * Statuses that prove a charge has been batched (settled), so a partial
+   * refund is a real refund. 'partial_refund' can only follow a settled
+   * refund. 'settled' is assumed; confirm against a batched sandbox charge.
+   */
+  public const SETTLED_STATUSES = ['settled', 'partial_refund'];
+
+  /**
+   * Whether the charge is known to have settled. FALSE means unsettled or
+   * unknown; both must be treated as unsettled.
+   */
+  public static function isSettled(array $charge): bool {
+    return in_array(strtolower(trim((string) (self::unwrap($charge)['status'] ?? ''))), self::SETTLED_STATUSES, TRUE);
+  }
+
+  /**
+   * Cents still refundable: the amount minus what was refunded, and nothing
+   * once the charge is voided.
+   *
+   * amount_voided is not used: when a refund is sent for an unsettled charge
+   * PayArc voids the whole charge but records only the amount asked for
+   * there (verified in the sandbox, 2026-09-24), and overwrites it on the
+   * next request.
    */
   public static function remainingCents(array $charge): ?int {
     $charge = self::unwrap($charge);
@@ -113,7 +134,10 @@ final class Charge {
     if ($amount === NULL) {
       return NULL;
     }
-    return max(0, $amount - (int) ($charge['amount_refunded'] ?? 0) - (int) ($charge['amount_voided'] ?? 0));
+    if (in_array(strtolower(trim((string) ($charge['status'] ?? ''))), ['void', 'voided', 'refunded'], TRUE)) {
+      return 0;
+    }
+    return max(0, $amount - (int) ($charge['amount_refunded'] ?? 0));
   }
 
   /**

@@ -30,7 +30,11 @@ final class ResponseReadersTest extends TestCase {
   }
 
   public function testRemainingAndCreatedTime(): void {
-    self::assertSame(600, Charge::remainingCents(['amount' => 1000, 'amount_refunded' => 400, 'amount_voided' => 0]));
+    self::assertSame(600, Charge::remainingCents(['amount' => 1000, 'amount_refunded' => 400, 'status' => 'partial_refund']));
+    // PayArc records only the asked-for amount in amount_voided but voids everything.
+    self::assertSame(0, Charge::remainingCents(['amount' => 200, 'amount_voided' => 75, 'status' => 'void']));
+    self::assertTrue(Charge::isSettled(['status' => 'settled']));
+    self::assertFalse(Charge::isSettled(['status' => 'submitted_for_settlement']));
     self::assertSame(1726057812, Charge::createdTime(['created_at' => 1726057812]));
     self::assertSame(strtotime('2018-11-26 14:06:54 UTC'), Charge::createdTime(['created_at' => '2018-11-26 14:06:54']));
     self::assertNull(Charge::createdTime([]));
