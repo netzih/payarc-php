@@ -117,3 +117,25 @@ Source: `probe-20260924043923.json`, plus follow-up tests on the same day.
 - **Other.** The rate limit header shows 90 requests. The account's default
   statement descriptor is "Chabad Jewish Center of R", which is too long, so
   PayArc cuts it off.
+
+### 2026-09-24: Hosted Fields tokens
+
+Source: `hosted-fields.jsonl`, runs hf-20260924044618 and hf-20260924044632.
+
+- **Q1: yes.** A browser token attaches to a customer, and the saved card
+  comes back `is_verified=1`.
+- **Q2: yes, for browser tokens too.** The saved card charged without a
+  CVV, as recurring, and was approved. `verifyCard()` authorized $1.00 and
+  voided it without error.
+- The token charge was approved and `charge_description` was kept.
+- The browser gets `{"token": "...", "card": {"first6", "last4"}}` back.
+- **Q11: yes.** Hosted Fields work on `http://localhost`, with no domain
+  registration needed in the sandbox.
+
+**Result: the recurring design stands.** Save the card first (one PayArc
+customer per card), then charge the saved card, including the first
+installment. No $1 authorization is needed at signup.
+
+Still open: Q3 (how long idempotency keys last), the status of a settled
+charge (settle-watch), Q9/Q10 (whether any PayArc email or text actually
+reaches the payer), and Q12 (wallets on a real domain).
